@@ -455,7 +455,7 @@ class MyTardisSwiftUploader:
             if line.strip().startswith("ETag: "):
                 object_found = True
                 swift_object_md5sum = \
-                    int(line.strip().split("ETag: ")[1])
+                    line.strip().split("ETag: ")[1]
                 break
         if object_found:
             print "\t\t%s was found in Swift." % swift_object_name
