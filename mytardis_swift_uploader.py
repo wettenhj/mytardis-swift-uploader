@@ -6,21 +6,8 @@
 # Thanks Grischa Meyer <grischa.meyer@monash.edu> for initial script
 
 # This version uses the directory field within the Datafile model,
-# in some queries' WHERE clauses, so if you don't already have an
-# index for the directory field, you should create one.
-
-# To do:
-# 1. Script currently queries MyTardis to see if a datafile already
-#      exists before uploading.  But if we know the dataset ID, we
-#      can also query the underlying storage in this case (Swift),
-#      e.g. swift stat next_gen_seq "dataset_name-dataset_id/subdir/filename"
-#      and then, if it exists, just register it via the API, instead of
-#      uploading it via POST.  That way, if the upload script gets stuck
-#      POSTing a large file, we can manually upload it using swiftclient.
-# 2. Can we simplify the way the storage box is specified, e.g.
-#      just pass in a string, like in the
-#      "Via shared permanent storage location" example here:
-#      https://mytardis.readthedocs.org/en/3.5/api.html
+# in some queries' WHERE clauses, so if you don't already have a
+# database index for the directory field, you should create one.
 
 import base64
 import os
@@ -33,19 +20,21 @@ from time import strftime
 import csv
 import poster
 import io
+import urllib
 import urllib2
 import sys
-import openrc
+import openrc_andrewHill
 import subprocess
+import traceback
 
 mytardis_base_url = "http://115.146.93.73"
 mytardis_username = "hilllab"
-mytardis_apikey = "0c0e8965199b5648f5dc7f62d76c31f38922bb5d"
+mytardis_apikey = "0c0e8965199b5648f5dc7f62d76c31f38922bb5d" # Fake API key for public GitHub version.
 
 swift_container_name = "next_gen_seq"
 
 USE_CHECKSUMS_TO_DETERMINE_FILES_ALREADY_UPLOADED = True
-
+CHECK_IN_SWIFT_BEFORE_POSTING_TO_MYTARDIS = True
 
 class MyTardisSwiftUploader:
 
@@ -59,6 +48,12 @@ class MyTardisSwiftUploader:
         self.v1_api_url = mytardis_url + "/api/v1/%s"
         self.username = username
         self.apikey = apikey
+
+    def _url_fix(self, url):
+        """
+        http://stackoverflow.com/questions/120951/how-can-i-normalize-a-url-in-python
+        """
+        return urllib.quote(url, safe="%/:=&?~#+!$,;'@()*[]")
 
     def upload_directory(self,
                          file_path,
@@ -95,7 +90,40 @@ class MyTardisSwiftUploader:
 
         storage_boxes_list = [storage_boxes_json['objects'][0]['resource_uri']]
 
+        # The following code is specific to IonTorrent next-gen seq data.
+        # It determines the experiment name from explog.txt or expMeta.dat
+
         exp_title = title or os.path.basename(os.path.abspath(file_path))
+
+        ds_desc = exp_title
+
+        explog_path = os.path.join(os.path.abspath(file_path), "explog.txt")
+        explogfinal_path = os.path.join(os.path.abspath(file_path), "explog_final.txt")
+        expmeta_path = os.path.join(os.path.abspath(file_path), "expMeta.dat")
+
+        if os.path.exists(explog_path):
+            with open(explog_path) as f:
+                explog_lines = f.readlines()
+
+            for line in explog_lines:
+                if line.startswith("Experiment Name: "):
+                    exp_title = line.split("Experiment Name: ")[1].strip()
+
+        if os.path.exists(explogfinal_path):
+            with open(explogfinal_path) as f:
+                explogfinal_lines = f.readlines()
+
+            for line in explogfinal_lines:
+                if line.startswith("Experiment Name: "):
+                    exp_title = line.split("Experiment Name: ")[1].strip()
+
+        elif os.path.exists(expmeta_path):
+            with open(expmeta_path) as f:
+                expmeta_lines = f.readlines()
+
+            for line in expmeta_lines:
+                if line.startswith("Run Name = "):
+                    exp_title = line.split("Run Name = ")[1].strip()
 
         created = False
         exp_url = self.get_existing_experiment(exp_title)
@@ -122,8 +150,6 @@ class MyTardisSwiftUploader:
             # print exp_url
 
         exp_id = exp_url.rsplit('/')[-2]
-
-        ds_desc = exp_title
 
         # print "Checking whether dataset already exists for: %s" % ds_desc
         ds_url = self.get_existing_dataset(ds_desc, exp_id)
@@ -158,45 +184,54 @@ class MyTardisSwiftUploader:
 
                 sub_file_path = os.path.join(dirname, filename)
 
+                # This could occur for a broken symbolic link:
+                if not os.path.exists(sub_file_path):
+                    print "WARNING: Skipping " + sub_file_path
+                    continue
+
                 subdirectory = os.path.relpath(dirname, file_path)
                 if subdirectory == ".":
                     subdirectory = ""
 
-                dataset_id = ds_url.rsplit('/')[-2]
+                ds_id = ds_url.rsplit('/')[-2]
                 md5sum = None
                 if USE_CHECKSUMS_TO_DETERMINE_FILES_ALREADY_UPLOADED:
                     md5sum = self._md5_file_calc(sub_file_path)
                 size = os.path.getsize(sub_file_path)
+
+                # if size > (4*10**9):
+                    # print "WARNING: Skipping large file: " + sub_file_path
+                    # continue
+
                 datafile_exists_in_mytardis = \
                     self.datafile_exists_in_mytardis(filename, subdirectory,
-                                                     dataset_id, md5sum)
+                                                     ds_id, md5sum)
 
                 datafile_exists_in_swift = False
-                if not datafile_exists_in_mytardis:
+                if CHECK_IN_SWIFT_BEFORE_POSTING_TO_MYTARDIS and \
+                        not datafile_exists_in_mytardis:
                     datafile_exists_in_swift = \
                         self.datafile_exists_in_swift(filename, subdirectory,
-                                                      dataset_id, ds_desc,
+                                                      ds_id, ds_desc,
                                                       md5sum)
-                if datafile_exists_in_swift and \
-                        not datafile_exists_in_mytardis:
-                    print "Datafile doesn't exist in MyTardis, but it was " + \
-                        "found in Swift, so maybe we can just register " + \
-                        "it, without needing to upload it using HTTP POST."
-                elif not datafile_exists_in_mytardis and \
+
+                if not datafile_exists_in_mytardis and \
                         not datafile_exists_in_swift:
-                    print "\t\tDidn't find existing datafile in MyTardis: %s" \
-                        % filename
-                    print "\t\tUploading file '%s' to dataset '%s'." % \
+                    print "\t\tUploading file '%s' to dataset '%s'..." % \
                         (sub_file_path, ds_desc)
 
                     if md5sum is None:
                         md5sum = self._md5_file_calc(sub_file_path)
+
+                    ds_id = ds_url.split("/")[-2]
+
                     # f_url = "/test/"
                     if not test_run:
-                        dataset_path = self._get_path_from_url(ds_url)
+                        ds_path = self._get_path_from_url(ds_url)
                         location = self.upload_file(sub_file_path,
                                                     subdirectory,
-                                                    dataset_path,
+                                                    ds_path,
+                                                    ds_desc, ds_id,
                                                     md5sum, size)
                         fail_count = 0
                         while location is None:
@@ -209,12 +244,50 @@ class MyTardisSwiftUploader:
                             print "\t\tRetrying failed upload for: " \
                                 + sub_file_path
 
-                            dataset_path = self._get_path_from_url(ds_url)
+                            ds_path = self._get_path_from_url(ds_url)
                             location = self.upload_file(sub_file_path,
                                                         subdirectory,
-                                                        dataset_path,
+                                                        ds_path,
+                                                        ds_desc, ds_id,
                                                         md5sum, size)
                         # print f_url
+                elif not datafile_exists_in_mytardis and \
+                        datafile_exists_in_swift:
+                    ds_id = ds_url.split("/")[-2]
+
+                    replicas = [{
+                        "url": os.path.join(ds_desc + "-" + ds_id, subdirectory, filename),
+                        "location": "swift",
+                        "protocol": "file"
+                        }]
+
+                    mimetype = mimetypes.guess_type(sub_file_path)[0]
+                    if sub_file_path.endswith(".sam") or \
+                            sub_file_path.endswith("expMeta.dat") or \
+                            sub_file_path.endswith("uploadStatus") or \
+                            sub_file_path.endswith(".summary") or \
+                            sub_file_path.endswith(".conf") or \
+                            sub_file_path.endswith(".json") or \
+                            sub_file_path.endswith(".fasta") or \
+                            sub_file_path.endswith(".fai") or \
+                            sub_file_path.endswith(".php") or \
+                            sub_file_path.endswith(".key") or \
+                            sub_file_path.endswith(".parsed") or \
+                            sub_file_path.endswith(".stats") or \
+                            sub_file_path.endswith(".histo.dat") or \
+                            sub_file_path.endswith(".log"):
+                        mimetype = "text/plain"
+
+                    ds_path = self._get_path_from_url(ds_url)
+                    location = self.register_file(ds_path, filename,
+                                                  subdirectory, md5sum,
+                                                  size, mimetype, replicas)
+                    if location:
+                        print "\t\tSuccessfully registered %s in MyTardis." % \
+                            os.path.join(subdirectory, filename)
+                    else:
+                        print "\t\tFailed to register %s in MyTardis." % \
+                            os.path.join(subdirectory, filename)
                 else:
                     print "\t\t%s has already been uploaded." \
                         % os.path.join(dirname, filename)
@@ -290,6 +363,7 @@ class MyTardisSwiftUploader:
             response = urllib2.urlopen(req)
         except:
             print "\n" + str(req.header_items()) + "\n"
+            print traceback.format_exc()
             # raise
             return None
 
@@ -399,10 +473,10 @@ class MyTardisSwiftUploader:
         return data.headers['Location']
 
     def datafile_exists_in_mytardis(self, filename, subdirectory,
-                                    dataset_id, md5sum):
+                                    ds_id, md5sum):
 
         url = self.mytardis_url + "/api/v1/dataset_file/?format=json" + \
-            "&dataset__id=" + dataset_id + \
+            "&dataset__id=" + ds_id + \
             "&filename=" + urllib2.quote(filename) + \
             "&directory=" + urllib2.quote(subdirectory)
 
@@ -435,14 +509,15 @@ class MyTardisSwiftUploader:
         return True
 
     def datafile_exists_in_swift(self, filename, subdirectory,
-                                 dataset_id, dataset_name, md5sum):
-        print "\t\tChecking whether datafile exists in Swift:"
-        swift_object_name = dataset_name + "-" + dataset_id + "/" + \
-            os.path.join(subdirectory, filename)
-        # print "\t\tswift_object_name: " + swift_object_name
+                                 ds_id, ds_desc, md5sum):
+        """
+        Skips MD5 check if md5sum is None.
+        """
+        swift_object_name = self._url_fix(ds_desc + "-" + ds_id + \
+            "/" + os.path.join(subdirectory, filename))
+
         swift_stat_cmd = "swift stat \"%s\" \"%s\"" % (swift_container_name,
                                                        swift_object_name)
-        print "\t\tswift_stat_cmd: " + str(swift_stat_cmd)
         swift_stat_proc = subprocess.Popen(swift_stat_cmd,
                                            stdout=subprocess.PIPE,
                                            stdin=subprocess.PIPE,
@@ -453,31 +528,144 @@ class MyTardisSwiftUploader:
         object_found = False
         for line in lines:
             if line.strip().startswith("ETag: "):
-                object_found = True
-                swift_object_md5sum = \
-                    line.strip().split("ETag: ")[1]
+                if md5sum is None:
+                    object_found = True
+                else:
+                    swift_object_md5sum = \
+                        line.strip().split("ETag: ")[1]
+                    object_found = (md5sum == swift_object_md5sum)
+                    if not object_found:
+                        print "Swift MD5 sum doesn't match for " + \
+                            os.path.join(subdirectory, filename)
                 break
         if object_found:
             print "\t\t%s was found in Swift." % swift_object_name
-            print "\t\tFile md5sum: %s." % swift_object_md5sum
             return True
 
         return False
 
     def upload_file(self, file_path, subdirectory,
-                    dataset_path, md5sum, size):
+                    ds_path, ds_desc, ds_id,
+                    md5sum, size):
 
-        file_dict = {u'dataset': dataset_path,
-                     u'filename': os.path.basename(file_path),
-                     u'directory': subdirectory,
-                     u'md5sum': md5sum,
-                     u'mimetype': mimetypes.guess_type(file_path)[0],
-                     u'size': size,
-                     u'parameter_sets': []}
+        filename = os.path.basename(file_path)
 
-        file_json = json.dumps(file_dict)
-        data = self._send_datafile(file_json, 'dataset_file/', 'POST',
-                                   file_path)
+        UPLOAD_TO_SWIFT_FIRST_THEN_REGISTER_IN_MYTARDIS = True
+        POST_TO_MYTARDIS_VIA_TASTYPIE_API = False
+
+        # The spaces in filenames issue affects using Python SwifClient's
+        # command-line interface, but the problem would probably disappear
+        # if we just imported swiftclient as a regular Python module.
+        if " " in filename:
+            UPLOAD_TO_SWIFT_FIRST_THEN_REGISTER_IN_MYTARDIS = False
+            POST_TO_MYTARDIS_VIA_TASTYPIE_API = True
+
+        if UPLOAD_TO_SWIFT_FIRST_THEN_REGISTER_IN_MYTARDIS:
+            swift_object_name = self._url_fix(ds_desc + "-" + ds_id + \
+                "/" + os.path.join(subdirectory, filename))
+
+            one_gigabyte = 1073741824
+            if size > one_gigabyte:
+                segmentation = "--segment-size %d" % one_gigabyte
+            else:
+                segmentation = ""
+
+            swift_upload_cmd = \
+                "swift upload %s --object-name=\"%s\" \"%s\" \"%s\"" \
+                % (segmentation, swift_object_name,
+                   swift_container_name, file_path)
+            # print "\t\tswift_upload_cmd: " + str(swift_upload_cmd)
+            swift_upload_proc = \
+                subprocess.Popen(swift_upload_cmd,
+                                 stdout=subprocess.PIPE,
+                                 stdin=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 shell=True,
+                                 universal_newlines=True)
+            stdout, stderr = swift_upload_proc.communicate()
+            lines = stdout.split("\n")
+            success = (swift_upload_proc.returncode == 0)
+            if success:
+                print "\t\tSuccessfully uploaded %s to Swift." % swift_object_name
+            else:
+                print "\t\tFailed to upload %s to Swift." % swift_object_name
+                print stderr
+                print stdout
+                return None
+
+            mimetype = mimetypes.guess_type(file_path)[0]
+            if file_path.endswith(".sam") or \
+                    file_path.endswith("expMeta.dat") or \
+                    file_path.endswith("uploadStatus") or \
+                    file_path.endswith(".summary") or \
+                    file_path.endswith(".conf") or \
+                    file_path.endswith(".json") or \
+                    file_path.endswith(".fasta") or \
+                    file_path.endswith(".fai") or \
+                    file_path.endswith(".php") or \
+                    file_path.endswith(".histo.dat") or \
+                    file_path.endswith(".log"):
+                mimetype = "text/plain"
+
+            replicas = [{
+                "url": os.path.join(ds_desc + "-" + ds_id, subdirectory, filename),
+                "location": "swift",
+                "protocol": "file"
+                }]
+            location = self.register_file(ds_path, filename, subdirectory,
+                                          md5sum, size, mimetype, replicas)
+            if location is not None:
+                print "\t\tSuccessfully registered %s in MyTardis." % swift_object_name
+            else:
+                print "\t\tFailed to register %s in MyTardis." % swift_object_name
+
+            return location
+        else:
+	    mimetype = mimetypes.guess_type(file_path)[0]
+            if file_path.endswith(".sam") or \
+                    file_path.endswith("expMeta.dat") or \
+                    file_path.endswith("uploadStatus") or \
+                    file_path.endswith(".summary") or \
+                    file_path.endswith(".conf") or \
+                    file_path.endswith(".json") or \
+                    file_path.endswith(".fasta") or \
+                    file_path.endswith(".fai") or \
+                    file_path.endswith(".php") or \
+                    file_path.endswith(".histo.dat") or \
+                    file_path.endswith(".log"):
+                mimetype = "text/plain"
+            datafile_dict = {u'dataset': ds_path,
+                             u'filename': os.path.basename(file_path),
+                             u'directory': subdirectory,
+                             u'md5sum': md5sum,
+                             u'mimetype': mimetype,
+                             u'size': size,
+                             u'parameter_sets': []}
+
+            datafile_json = json.dumps(datafile_dict)
+            data = self._send_datafile(datafile_json, 'dataset_file/', 'POST',
+                                       file_path)
+            if data is None:
+                return None
+
+            return data.headers['location']
+
+    def register_file(self, ds_path, filename, subdirectory,
+                      md5sum, size, mimetype, replicas):
+
+        datafile_dict = {u'dataset': ds_path,
+                         u'filename': filename,
+                         u'directory': subdirectory,
+                         u'md5sum': md5sum,
+                         u'size': size,
+                         u'mimetype': mimetype,
+                         u'replicas': replicas,
+                         u'parameter_sets': []}
+
+        datafile_json = json.dumps(datafile_dict)
+
+        data = self._send_data(datafile_json, 'dataset_file/')
+
         if data is None:
             return None
 
@@ -485,11 +673,6 @@ class MyTardisSwiftUploader:
 
 
 def run():
-    ####
-    # Le Script
-    ####
-    #   steve.androulakis@monash.edu
-    ####
 
     from optparse import OptionParser
     import getpass
