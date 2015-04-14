@@ -258,7 +258,8 @@ class MyTardisSwiftUploader:
                     replicas = [{
                         "url": os.path.join(ds_desc + "-" + ds_id, subdirectory, filename),
                         "location": "swift",
-                        "protocol": "file"
+                        "protocol": "file",
+                        "verified": False
                         }]
 
                     mimetype = mimetypes.guess_type(sub_file_path)[0]
@@ -610,7 +611,8 @@ class MyTardisSwiftUploader:
             replicas = [{
                 "url": os.path.join(ds_desc + "-" + ds_id, subdirectory, filename),
                 "location": "swift",
-                "protocol": "file"
+                "protocol": "file",
+                "verified": False
                 }]
             location = self.register_file(ds_path, filename, subdirectory,
                                           md5sum, size, mimetype, replicas)
